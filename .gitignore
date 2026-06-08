@@ -1,0 +1,83 @@
+# NyxFrame: project-specific .gitignore
+
+# --- Binaries and packages
+nyxframe-server
+/server/go/server
+*.apk
+*.aab
+nyxframe-*-*.apk
+
+# --- Build outputs
+**/build/
+android/app/build/
+target/
+
+# --- Gradle / Android
+.gradle/
+android/.gradle/
+local.properties
+android/local.properties
+*.keystore
+*.jks
+android/app/src/main/assets/config.json
+
+# --- Config / secrets (keep example files tracked)
+config.json
+server/config.json
+android/config.json
+!config.json.example
+!server/config.json.example
+!android/config.json.example
+
+# --- IDEs and editors
+.idea/
+*.iml
+*.hprof
+.vscode/
+
+# --- OS files
+.DS_Store
+Thumbs.db
+
+# --- Logs, temp, and caches
+logs/
+*.log
+*.tmp
+temp/
+tmp/
+
+# --- Python
+__pycache__/
+*.py[cod]
+*$py.class
+env/
+venv/
+venv*/
+
+# --- Rust
+target/
+**/*.rs.bk
+
+# --- Go
+server/go/export/
+server/go/server.exe
+
+# --- Native Android build artifacts
+.cxx/
+.externalNativeBuild/
+captures/
+
+# --- IPC and sockets
+*.sock
+
+# --- Editor swap files
+*.swp
+*~
+
+# --- Coverage and test outputs
+coverage/
+*.coverage
+test-results/
+
+# --- Misc
+.antigravitycli/
