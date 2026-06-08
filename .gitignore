@@ -11,6 +11,7 @@ nyxframe-*-*.apk
 **/build/
 android/app/build/
 target/
+node_modules/
 
 # --- Gradle / Android
 .gradle/
