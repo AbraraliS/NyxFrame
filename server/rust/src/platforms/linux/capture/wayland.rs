@@ -1,7 +1,14 @@
+// Wayland screen capturer via XDG Desktop Portal + PipeWire + GStreamer
+//
+// Works on GNOME Wayland, Niri, Sway and any compositor with xdg-desktop-portal.
+// Requires the user to approve the screenshare dialog ONCE.
+//
+// Environment variables are set automatically when running under sudo so the
+// portal D-Bus request reaches the user's session.
+
 use std::io;
-use log::{info, error};
-use super::CaptureFrame;
 use gstreamer::prelude::*;
+use gstreamer_app::AppSink;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
 use ashpd::WindowIdentifier;
@@ -9,106 +16,180 @@ use std::os::fd::IntoRawFd;
 
 pub struct WaylandCapturer {
     pipeline: gstreamer::Pipeline,
-    appsink: gstreamer_app::AppSink,
+    appsink: AppSink,
+    width: u32,
+    height: u32,
 }
 
 impl WaylandCapturer {
     pub fn new() -> io::Result<Self> {
-        info!("Initializing Wayland/PipeWire capture engine with ashpd...");
-        gstreamer::init().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        // ── Ensure the user's Wayland/D-Bus session is reachable ──────────────
+        // When running as root, these are stripped by sudo. Probe and restore them
+        // so the XDG portal can be contacted and PipeWire can connect.
+        for uid in 999u32..=1005 {
+            let runtime_dir = format!("/run/user/{}", uid);
+            let bus_path = format!("{}/bus", runtime_dir);
+            if std::path::Path::new(&bus_path).exists() {
+                if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+                    let addr = format!("unix:path={}", bus_path);
+                    std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &addr);
+                    log::info!("WaylandCapturer: auto-set DBUS_SESSION_BUS_ADDRESS={}", addr);
+                }
+                if std::env::var("XDG_RUNTIME_DIR").is_err() {
+                    std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+                    log::info!("WaylandCapturer: auto-set XDG_RUNTIME_DIR={}", runtime_dir);
+                }
+                break;
+            }
+        }
 
-        // Run ashpd portal request in an isolated tokio runtime
+        // Set WAYLAND_DISPLAY if not present (try wayland-0 and wayland-1)
+        if std::env::var("WAYLAND_DISPLAY").is_err() {
+            for name in &["wayland-0", "wayland-1"] {
+                let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+                if std::path::Path::new(&format!("{}/{}", xdg, name)).exists() {
+                    std::env::set_var("WAYLAND_DISPLAY", name);
+                    log::info!("WaylandCapturer: auto-set WAYLAND_DISPLAY={}", name);
+                    break;
+                }
+            }
+        }
+
+        log::info!("WaylandCapturer: DBUS_SESSION_BUS_ADDRESS={:?}",
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| "NOT SET".into()));
+        log::info!("WaylandCapturer: WAYLAND_DISPLAY={:?}",
+            std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "NOT SET".into()));
+
+        // ── Init GStreamer ─────────────────────────────────────────────────────
+        gstreamer::init()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // ── Request screencast via XDG Desktop Portal ──────────────────────────
+        log::info!("Requesting screenshare via XDG portal (user approval may appear)...");
         let rt = tokio::runtime::Runtime::new()?;
-        let (fd, node_id) = rt.block_on(async {
-            info!("Requesting Screencast portal session...");
+        let (fd, node_id, width, height) = rt.block_on(async {
             let screencast = Screencast::new().await.map_err(|e| {
-                error!("ashpd Screencast::new failed: {:?}", e);
-                io::Error::new(io::ErrorKind::Other, e.to_string())
+                io::Error::new(io::ErrorKind::Other,
+                    format!("Portal Screencast::new failed: {} — is xdg-desktop-portal running?", e))
             })?;
+
             let session = screencast.create_session().await.map_err(|e| {
-                error!("ashpd create_session failed: {:?}", e);
-                io::Error::new(io::ErrorKind::Other, e.to_string())
+                io::Error::new(io::ErrorKind::Other, format!("create_session: {}", e))
             })?;
-            
+
             screencast.select_sources(
                 &session,
                 CursorMode::Metadata,
-                SourceType::Monitor | SourceType::Window,
-                true,
-                None,
-                PersistMode::DoNot
+                SourceType::Monitor.into(),
+                false,                       // multiple = false (one monitor)
+                None,                        // no restore token
+                PersistMode::ExplicitlyRevoked,
             ).await.map_err(|e| {
-                error!("ashpd select_sources failed: {:?}", e);
-                io::Error::new(io::ErrorKind::Other, e.to_string())
+                io::Error::new(io::ErrorKind::Other, format!("select_sources: {}", e))
             })?;
 
-            info!("Starting screencast session. Waiting for user approval...");
-            let response = screencast.start(&session, &WindowIdentifier::default()).await
+            log::info!("Portal: waiting for user approval of screen share...");
+            let response = screencast
+                .start(&session, &WindowIdentifier::default())
+                .await
                 .map_err(|e| {
-                    error!("ashpd start failed: {:?}", e);
-                    io::Error::new(io::ErrorKind::Other, e.to_string())
+                    io::Error::new(io::ErrorKind::Other,
+                        format!("Portal start failed: {} — did you approve the screen share dialog?", e))
                 })?;
 
             let payload = response.response().map_err(|e| {
-                error!("ashpd response failed: {:?}", e);
-                io::Error::new(io::ErrorKind::Other, e.to_string())
+                io::Error::new(io::ErrorKind::Other,
+                    format!("Portal response error: {} — screen share was denied or no monitors selected", e))
             })?;
+
             let streams = payload.streams();
             if streams.is_empty() {
-                error!("ashpd streams empty! User denied or no streams selected");
-                return Err(io::Error::new(io::ErrorKind::Other, "User denied or no streams selected"));
+                return Err(io::Error::new(io::ErrorKind::Other,
+                    "Portal returned no streams — did you select a monitor in the dialog?"));
             }
 
-            let node_id = streams[0].pipe_wire_node_id();
-            let fd = screencast.open_pipe_wire_remote(&session).await
-                .map_err(|e| {
-                    error!("ashpd open_pipe_wire_remote failed: {:?}", e);
-                    io::Error::new(io::ErrorKind::Other, e.to_string())
-                })?;
+            let stream = &streams[0];
+            let node_id = stream.pipe_wire_node_id();
 
-            info!("Screencast portal approved! node_id: {}", node_id);
-            Ok::<_, io::Error>((fd.into_raw_fd(), node_id))
+            // Extract reported resolution (may be None on some portals)
+            let (w, h) = stream.size()
+                .map(|(sw, sh)| (sw as u32, sh as u32))
+                .unwrap_or((1920, 1080));
+
+            log::info!("Portal approved! PipeWire node_id={} reported_size={}x{}", node_id, w, h);
+
+            let fd = screencast.open_pipe_wire_remote(&session).await.map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("open_pipe_wire_remote: {}", e))
+            })?;
+
+            Ok::<_, io::Error>((fd.into_raw_fd(), node_id, w, h))
         })?;
 
-        // Pass fd and node_id to pipewiresrc
+        // ── Build GStreamer pipeline from PipeWire source ─────────────────────
         let pipeline_str = format!(
-            "pipewiresrc fd={} path={} ! videoconvert ! video/x-raw,format=BGRA ! appsink name=sink max-buffers=1 drop=true",
-            fd, node_id
+            "pipewiresrc fd={fd} path={node_id} always-copy=true ! \
+             videoconvert ! \
+             video/x-raw,format=BGRx ! \
+             appsink name=sink max-buffers=2 drop=true emit-signals=false"
         );
-        
-        info!("Launching GStreamer pipeline with specific portal node...");
+        log::info!("GStreamer pipeline: {}", pipeline_str);
+
         let pipeline = gstreamer::parse::launch(&pipeline_str)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                format!("GStreamer parse failed: {} — is gst-plugin-pipewire installed?", e)))?
             .downcast::<gstreamer::Pipeline>()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Not a pipeline"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Not a GStreamer Pipeline"))?;
 
         let appsink = pipeline
             .by_name("sink")
-            .unwrap()
-            .downcast::<gstreamer_app::AppSink>()
-            .unwrap();
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "appsink 'sink' not found"))?
+            .downcast::<AppSink>()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Not an AppSink"))?;
 
-        pipeline.set_state(gstreamer::State::Playing)
+        pipeline
+            .set_state(gstreamer::State::Playing)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        Ok(Self { pipeline, appsink })
+        log::info!("✓ WaylandCapturer ready: {}x{} via PipeWire node {}", width, height, node_id);
+        Ok(Self { pipeline, appsink, width, height })
     }
 
-    pub fn capture_frame(&mut self) -> io::Result<CaptureFrame> {
-        let sample = self.appsink.pull_sample().map_err(|_| io::Error::new(io::ErrorKind::Other, "End of stream"))?;
-        let buffer = sample.buffer().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No buffer"))?;
-        let map = buffer.map_readable().map_err(|_| io::Error::new(io::ErrorKind::Other, "Cannot map buffer"))?;
-        
-        let caps = sample.caps().unwrap();
-        let structure = caps.structure(0).unwrap();
-        let width = structure.get::<i32>("width").unwrap_or(1920) as u32;
-        let height = structure.get::<i32>("height").unwrap_or(1080) as u32;
+    pub fn capture_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        // Try pulling a sample with 50ms timeout (non-blocking feel)
+        match self.appsink.try_pull_sample(gstreamer::ClockTime::from_mseconds(50)) {
+            Some(sample) => {
+                // Update dimensions from actual caps (in case they differ from reported)
+                if let Some(caps) = sample.caps() {
+                    if let Some(st) = caps.structure(0) {
+                        if let (Ok(w), Ok(h)) = (
+                            st.get::<i32>("width"),
+                            st.get::<i32>("height"),
+                        ) {
+                            self.width = w as u32;
+                            self.height = h as u32;
+                        }
+                    }
+                }
 
-        Ok(CaptureFrame {
-            data: map.as_slice().to_vec(),
-            width,
-            height,
-            format: "bgra",
-        })
+                let buffer = sample.buffer().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Other, "No buffer in GStreamer sample")
+                })?;
+                let map = buffer.map_readable().map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Cannot map GStreamer buffer")
+                })?;
+                Ok(Some(map.as_slice().to_vec()))
+            }
+            None => Ok(None), // Timeout — no new frame yet
+        }
+    }
+
+    pub fn width(&self) -> u32 { self.width }
+    pub fn height(&self) -> u32 { self.height }
+}
+
+impl Drop for WaylandCapturer {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
+        log::info!("WaylandCapturer: GStreamer pipeline stopped.");
     }
 }

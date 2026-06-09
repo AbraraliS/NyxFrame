@@ -21,19 +21,38 @@ impl UdsServer {
         
         // Remove existing socket file if it exists
         if path.exists() {
-            fs::remove_file(path)?;
+            if let Err(e) = fs::remove_file(path) {
+                log::error!("FAILED to remove_file: {}", e);
+                return Err(e);
+            }
         }
 
-        info!("Binding UDS Server to: {}", socket_path);
-        let listener = UnixListener::bind(path)?;
+        println!("Binding UDS Server to: {}", socket_path);
+        log::info!("Binding UDS Server to: {}", socket_path);
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("FAILED to bind: {}", e);
+                return Err(e);
+            }
+        };
         
         // Ensure standard users can connect to the socket
-        let mut perms = fs::metadata(path)?.permissions();
+        let mut perms = match fs::metadata(path) {
+            Ok(m) => m.permissions(),
+            Err(e) => {
+                log::error!("FAILED to get metadata: {}", e);
+                return Err(e);
+            }
+        };
         perms.set_readonly(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o666)) {
+                log::error!("FAILED to set_permissions: {}", e);
+                return Err(e);
+            }
         }
 
         Ok(UdsServer { 

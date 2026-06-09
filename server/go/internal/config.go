@@ -13,9 +13,31 @@ import (
 
 var (
 	Port             = "9090"
-	SocketPath       = "/tmp/nyxframe3.sock"
-	WindowManagerCmd = "i3-msg"
+	SocketPath       = "/home/drstone/.local/share/nyxframe/nyxframe.sock"
+	WindowManagerCmd = autoDetectWM()
 )
+
+// autoDetectWM detects the running compositor/WM and returns the correct IPC command.
+func autoDetectWM() string {
+	desktop := os.Getenv("XDG_CURRENT_DESKTOP")
+	session := os.Getenv("XDG_SESSION_DESKTOP")
+	combined := strings.ToLower(desktop + " " + session)
+
+	switch {
+	case strings.Contains(combined, "niri"):
+		log.Printf("[WM] Detected Niri compositor — using 'niri msg'\n")
+		return "niri"
+	case strings.Contains(combined, "sway"):
+		log.Printf("[WM] Detected Sway compositor — using 'swaymsg'\n")
+		return "swaymsg"
+	case strings.Contains(combined, "hyprland"):
+		log.Printf("[WM] Detected Hyprland — using 'hyprctl'\n")
+		return "hyprctl"
+	default:
+		log.Printf("[WM] Defaulting to i3-msg (desktop=%q)\n", desktop)
+		return "i3-msg"
+	}
+}
 
 var logFile *os.File
 var logFileMutex sync.Mutex

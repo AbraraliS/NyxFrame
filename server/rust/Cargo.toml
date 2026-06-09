@@ -23,20 +23,21 @@ env_logger = "0.11"
 
 # Utilities
 byteorder = "1.5"
-ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 
-# ─── Linux-specific dependencies ───────────────────────────────────────────────
+# ─── Screen Capture ──────────────────────────────────────────────────────────
+# scrap — X11 capture via XCB (used for native X11 sessions)
+scrap = "0.5"
+
+# ─── Linux-specific dependencies ─────────────────────────────────────────────
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Safe X11 bindings using XCB protocol layers with SHM + RandR features
+# Safe X11 bindings (for input emulation)
 xcb = { version = "1.2", features = ["shm", "randr"] }
 
-# GStreamer for Wayland/PipeWire capture pipeline
-gstreamer = { version = "0.22", optional = true }
-gstreamer-app = { version = "0.22", optional = true }
-gstreamer-video = { version = "0.22", optional = true }
+# XDG Desktop Portal for Wayland screencasting (PipeWire)
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 
-[features]
-default = ["wayland-capture"]
-wayland-capture = ["gstreamer", "gstreamer-app", "gstreamer-video"]
-
+# GStreamer for reading PipeWire screencast frames
+gstreamer     = "0.22"
+gstreamer-app = "0.22"
+gstreamer-video = "0.22"

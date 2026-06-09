@@ -47,6 +47,49 @@ func StartXdotoolWorker() {
 	}
 }
 
+// runWMCmd dispatches a compositor/WM command with correct syntax per detected WM.
+func runWMCmd(action string, args ...string) {
+	go func() {
+		var execCmd *exec.Cmd
+		wm := WindowManagerCmd
+
+		switch wm {
+		case "niri":
+			// niri msg action <action> [args...]
+			// e.g.: niri msg action focus-workspace 1
+			//       niri msg action toggle-window-fullscreen
+			niriArgs := append([]string{"msg", "action", action}, args...)
+			execCmd = exec.Command("niri", niriArgs...)
+
+		case "swaymsg":
+			// swaymsg [action] [args]
+			full := append([]string{action}, args...)
+			execCmd = exec.Command("swaymsg", full...)
+
+		case "hyprctl":
+			// hyprctl dispatch <action> [args]
+			full := append([]string{"dispatch", action}, args...)
+			execCmd = exec.Command("hyprctl", full...)
+
+		default:
+			// i3-msg: i3-msg [action] [args]
+			full := append([]string{action}, args...)
+			execCmd = exec.Command(wm, full...)
+			if sockPath := getI3SocketPath(); sockPath != "" {
+				execCmd.Env = append(os.Environ(), "I3SOCK="+sockPath, "DISPLAY=:0")
+			}
+		}
+
+		if execCmd.Env == nil {
+			execCmd.Env = append(os.Environ(), "DISPLAY=:0")
+		}
+
+		if err := execCmd.Run(); err != nil {
+			log.Printf("Warning: WM command [%s %s %v] failed: %v\n", wm, action, args, err)
+		}
+	}()
+}
+
 func handleCommand(message []byte) {
 	var cmd Command
 	if err := json.Unmarshal(message, &cmd); err != nil {
@@ -71,51 +114,46 @@ func handleCommand(message []byte) {
 	case "workspace":
 		if cmd.Text != "" {
 			ws := cmd.Text
-			isNumeric := true
-			for _, r := range ws {
-				if r < '0' || r > '9' {
-					isNumeric = false
-					break
-				}
-			}
-
-			var i3Args []string
-			if isNumeric {
-				cmdLog.Printf("Workspace → %s", ws)
-				i3Args = []string{"workspace", "number", ws}
-			} else {
-				cmdLog.Printf("Workspace → %s", ws)
-				i3Args = []string{"workspace", ws}
-			}
+			cmdLog.Printf("Workspace → %s", ws)
 			cmdLog.Flush()
 
-			go func(args []string) {
-				execCmd := exec.Command(WindowManagerCmd, args...)
-				execCmd.Env = os.Environ()
-				if sockPath := getI3SocketPath(); sockPath != "" {
-					execCmd.Env = append(execCmd.Env, "I3SOCK="+sockPath)
+			switch WindowManagerCmd {
+			case "niri":
+				// niri msg action focus-workspace <n>  (only supports numeric)
+				runWMCmd("focus-workspace", ws)
+			case "swaymsg":
+				runWMCmd("workspace", "number", ws)
+			case "hyprctl":
+				runWMCmd("workspace", ws)
+			default:
+				// i3-msg
+				isNumeric := true
+				for _, r := range ws {
+					if r < '0' || r > '9' {
+						isNumeric = false
+						break
+					}
 				}
-				execCmd.Env = append(execCmd.Env, "DISPLAY=:0")
-				if err := execCmd.Run(); err != nil {
-					log.Printf("Warning: %s workspace switch failed: %v\n", WindowManagerCmd, err)
+				if isNumeric {
+					runWMCmd("workspace", "number", ws)
+				} else {
+					runWMCmd("workspace", ws)
 				}
-			}(i3Args)
+			}
 		}
 
 	case "fullscreen":
 		cmdLog.Flush()
 		log.Printf("Fullscreen toggle\n")
-		go func() {
-			execCmd := exec.Command(WindowManagerCmd, "fullscreen", "toggle")
-			execCmd.Env = os.Environ()
-			if sockPath := getI3SocketPath(); sockPath != "" {
-				execCmd.Env = append(execCmd.Env, "I3SOCK="+sockPath)
-			}
-			execCmd.Env = append(execCmd.Env, "DISPLAY=:0")
-			if err := execCmd.Run(); err != nil {
-				log.Printf("Warning: %s fullscreen toggle failed: %v\n", WindowManagerCmd, err)
-			}
-		}()
+		switch WindowManagerCmd {
+		case "niri":
+			runWMCmd("toggle-window-fullscreen")
+		case "hyprctl":
+			runWMCmd("fullscreen", "0")
+		default:
+			// i3-msg, swaymsg
+			runWMCmd("fullscreen", "toggle")
+		}
 
 	case "text":
 		if cmd.Text != "" {

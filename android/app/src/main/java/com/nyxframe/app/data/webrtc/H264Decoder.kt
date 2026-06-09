@@ -230,7 +230,6 @@ class H264Decoder(
         } finally {
             mediaCodec = null
             isInitialized = false
-            activeSurface = null
             consecutiveErrors = 0
             Log.i("H264Decoder", "MediaCodec released and state fully reset.")
         }

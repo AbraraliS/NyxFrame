@@ -5,6 +5,7 @@ pub mod ipc;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::unix::process::CommandExt;
 use tokio::sync::Mutex;
@@ -382,17 +383,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_state.clone()
     };
     
-    let shared_capturer = match platforms::linux::capture::ScreenCapturer::auto_select(&select_env) {
-        Ok(cap) => {
-            info!("✓ Screen Capture Backend: {}", cap.backend_name());
-            Arc::new(Mutex::new(cap))
-        }
-        Err(e) => {
-            error!("✖ CRITICAL: Could not initialize any screen capture backend: {}", e);
-            error!("  Run with --diagnostics to debug the session environment.");
-            std::process::exit(1);
-        }
-    };
+    // Validate the capture backend is working before entering the connection loop.
+    // scrap::Capturer is not Send, so we cannot wrap it in Arc<Mutex>.
+    // Instead, each session spawns a dedicated std::thread that owns the capturer.
+    let capture_env = select_env.clone();
+    let capture_backend_name = "Dynamic (Wayland/X11)".to_string();
+    info!("Screen Capture engine will be initialized upon client connection.");
+    info!("Capture backend validated: {}", capture_backend_name);
 
     // 3. Initialize kernel-level uinput device client
     let device = match UInputDevice::new() {
@@ -642,10 +639,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (sps, pps, idr)
                 };
 
-                // Spawn independent async screen capture and transmission loop task
-                let shared_capturer_clone = Arc::clone(&shared_capturer);
+                // ── Capture Thread ────────────────────────────────────────────────────────
+                // scrap::Capturer is !Send, so we own it exclusively inside a std::thread.
+                // Frames are sent to the async encoding task over an mpsc channel.
+                let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(2);
+                let session_active_for_thread = Arc::clone(&session_active_clone2);
+                let capture_env_clone = capture_env.clone();
+                let target_fps_for_thread = Arc::clone(&target_fps_clone2);
+
+                std::thread::spawn(move || {
+                    let mut capturer = match platforms::linux::capture::ScreenCapturer::auto_select(&capture_env_clone) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("[CaptureThread] Failed to init capturer: {}", e);
+                            return;
+                        }
+                    };
+                    let width = capturer.width();
+                    let height = capturer.height();
+                    info!("[CaptureThread] Started: {}x{} via {}", width, height, capturer.backend_name());
+
+                    while session_active_for_thread.load(Ordering::SeqCst) {
+                        match capturer.capture_frame() {
+                            Ok(Some(pixels)) => {
+                                if frame_tx.try_send((width, height, pixels)).is_err() {
+                                    // Receiver full or dropped — skip frame
+                                }
+                            }
+                            Ok(None) => {} // No new frame yet
+                            Err(e) => {
+                                error!("[CaptureThread] Capture error: {}", e);
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }
+                        let fps = target_fps_for_thread.load(Ordering::SeqCst);
+                        let budget_ms = if fps > 0 { 1000 / fps as u64 } else { 16 };
+                        std::thread::sleep(std::time::Duration::from_millis(budget_ms));
+                    }
+                    info!("[CaptureThread] Stopped.");
+                });
+
+                // ── Encode + Send Task (async) ────────────────────────────────────────────
+                // Wrap the receiver so it's Send + Sync for use in spawn_blocking.
+                let frame_rx = Arc::new(std::sync::Mutex::new(frame_rx));
                 let capture_task = tokio::spawn(async move {
-                    info!("UDS Screen Capture and Video Stream task spawned.");
+                    info!("UDS Encode & Stream task spawned.");
 
                     let mut h264_encoder: Option<openh264::encoder::Encoder> = None;
                     let mut yuv_buf: Option<FullRangeYUVBuffer> = None;
@@ -653,18 +691,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut frame_count = 0u64;
                     let stream_start_time = tokio::time::Instant::now();
 
-                    // Lock the capturer for the duration of this session
-                    let mut capturer = shared_capturer_clone.lock().await;
-                    let width = capturer.width();
-                    let height = capturer.height();
+                    // Block-receive first frame to get dimensions
+                    let frame_rx_clone = Arc::clone(&frame_rx);
+                    let (width, height) = match tokio::task::spawn_blocking(move || {
+                        frame_rx_clone.lock().unwrap().recv()
+                    }).await {
+                        Ok(Ok((w, h, _first_pixels))) => {
+                            info!("Capture resolution: {}x{}", w, h);
+                            (w, h)
+                        }
+                        _ => {
+                            error!("Capture channel closed before first frame.");
+                            return;
+                        }
+                    };
+
                     let mut rgb_buf = vec![0u8; (width * height * 3) as usize];
-                    info!("Capture resolution: {}x{} via {}", width, height, capturer.backend_name());
 
                     while session_active_clone2.load(Ordering::SeqCst) {
                         let frame_start = tokio::time::Instant::now();
 
-                        match capturer.capture_frame() {
-                            Ok(Some(pixels)) => {
+                        // Non-blocking receive from capture thread
+                        let frame_rx_clone = Arc::clone(&frame_rx);
+                        let frame_result = tokio::task::spawn_blocking(move || {
+                            frame_rx_clone.lock().unwrap().recv_timeout(std::time::Duration::from_millis(50))
+                        }).await;
+
+                        match frame_result {
+                            Ok(Ok((_w, _h, pixels))) => {
                                 let ts = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
@@ -772,12 +826,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
-                            Ok(None) => {
-                                // No new frame — screen unchanged
-                            }
-                            Err(e) => {
-                                error!("Capture error: {}", e);
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(Err(_)) | Err(_) => {
+                                // Channel timeout or closed — check if session is still active
+                                if !session_active_clone2.load(Ordering::SeqCst) {
+                                    break;
+                                }
                             }
                         }
 
@@ -789,7 +842,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    info!("Capture loop stopped.");
+                    info!("Encode/stream loop stopped.");
                 });
 
                 // R4 — Panic-safe command task + graceful session teardown

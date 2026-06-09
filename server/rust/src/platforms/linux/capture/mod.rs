@@ -1,73 +1,80 @@
-// NyxFrame Capture Engine
-// Supports: Linux X11 (XCB MIT-SHM), Linux Wayland (GStreamer/PipeWire)
-
-pub mod x11;
 pub mod wayland;
-
-#[cfg(target_os = "linux")]
-pub use self::x11::X11Capturer;
-#[cfg(target_os = "linux")]
-pub use self::wayland::WaylandCapturer;
+pub mod x11;
 
 use std::io;
 use crate::platforms::linux::env::EnvState;
 
-pub struct CaptureFrame {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub format: &'static str,
-}
-
 pub enum ScreenCapturer {
-    #[cfg(target_os = "linux")]
-    X11(X11Capturer),
-    #[cfg(target_os = "linux")]
-    Wayland(WaylandCapturer),
+    Wayland(wayland::WaylandCapturer),
+    X11(x11::X11Capturer),
 }
 
 impl ScreenCapturer {
     pub fn auto_select(env: &EnvState) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            if env.xdg_session_type.as_deref() == Some("wayland") {
-                log::info!("Session Detection: Wayland preferred. Attempting PipeWire capture...");
-                if let Ok(capturer) = WaylandCapturer::new() {
-                    return Ok(ScreenCapturer::Wayland(capturer));
+        let mut is_wayland = env.xdg_session_type.as_deref() == Some("wayland")
+            || env.wayland_display.is_some();
+
+        // If sudo stripped the env vars, we might still be on Wayland.
+        // Probe for Wayland sockets in common runtime directories.
+        if !is_wayland {
+            for uid in 999u32..=1005 {
+                let rtdir = format!("/run/user/{}", uid);
+                if std::path::Path::new(&format!("{}/wayland-0", rtdir)).exists()
+                    || std::path::Path::new(&format!("{}/wayland-1", rtdir)).exists()
+                {
+                    is_wayland = true;
+                    break;
                 }
-                log::warn!("Wayland capture failed. Falling back to X11 (Xwayland)...");
-            }
-            if let Ok(capturer) = X11Capturer::new() {
-                return Ok(ScreenCapturer::X11(capturer));
             }
         }
-        Err(io::Error::new(io::ErrorKind::Other, "No capture backend available"))
+
+        if is_wayland {
+            log::info!("Detected Wayland session. Attempting PipeWire portal capture...");
+            match wayland::WaylandCapturer::new() {
+                Ok(capturer) => {
+                    let _ = std::fs::write("/tmp/capturer_used.txt", "Wayland");
+                    return Ok(ScreenCapturer::Wayland(capturer));
+                }
+                Err(e) => {
+                    log::warn!("Wayland capture init failed: {}", e);
+                    log::warn!("Falling back to X11 capturer (which will capture the Xwayland root window)...");
+                }
+            }
+        } else {
+            log::info!("Detected X11 session.");
+        }
+
+        log::info!("Attempting X11 capture...");
+        let _ = std::fs::write("/tmp/capturer_used.txt", "X11");
+        let capturer = x11::X11Capturer::new()?;
+        Ok(ScreenCapturer::X11(capturer))
     }
 
     pub fn capture_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        let frame = match self {
-            #[cfg(target_os = "linux")]
-            ScreenCapturer::X11(c) => c.capture_frame()?,
-            #[cfg(target_os = "linux")]
-            ScreenCapturer::Wayland(c) => c.capture_frame()?,
-        };
-        Ok(Some(frame.data))
+        match self {
+            ScreenCapturer::Wayland(c) => c.capture_frame(),
+            ScreenCapturer::X11(c) => c.capture_frame(),
+        }
     }
 
     pub fn width(&self) -> u32 {
-        1920
+        match self {
+            ScreenCapturer::Wayland(c) => c.width(),
+            ScreenCapturer::X11(c) => c.width(),
+        }
     }
 
     pub fn height(&self) -> u32 {
-        1080
+        match self {
+            ScreenCapturer::Wayland(c) => c.height(),
+            ScreenCapturer::X11(c) => c.height(),
+        }
     }
 
     pub fn backend_name(&self) -> &'static str {
         match self {
-            #[cfg(target_os = "linux")]
-            ScreenCapturer::X11(_) => "X11",
-            #[cfg(target_os = "linux")]
             ScreenCapturer::Wayland(_) => "Wayland (PipeWire)",
+            ScreenCapturer::X11(_) => "X11 (XCB)",
         }
     }
 }

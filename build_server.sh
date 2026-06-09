@@ -173,7 +173,8 @@ build_rust() {
         cargo build --release
         
         echo "✓ Server binary built at: ./target/release/nyxframe-server"
-        cp target/release/nyxframe-server ./
+        rm -f ../../nyxframe-server
+        cp target/release/nyxframe-server ../../nyxframe-server
         echo "✓ Server binary copied to root as: nyxframe-server"
         echo "Run with: sudo ./nyxframe-server -m x11"
     else
