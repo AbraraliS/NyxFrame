@@ -30,10 +30,10 @@ struct UinputUserDev {
     name: [i8; 80],
     id: InputId,
     ff_effects_max: u32,
-    absmax: [i32; 8], // ABS_CNT = 64, but we only configure a subset if legacy
-    absmin: [i32; 8],
-    absfuzz: [i32; 8],
-    absflat: [i32; 8],
+    absmax: [i32; 64], // ABS_CNT = 0x40 (64)
+    absmin: [i32; 64],
+    absfuzz: [i32; 64],
+    absflat: [i32; 64],
 }
 
 #[repr(C)]
@@ -97,8 +97,8 @@ impl UInputDevice {
         {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open /dev/uinput: {}. Falling back to /dev/null for testing.", e);
-                OpenOptions::new().write(true).open("/dev/null")?
+                error!("✖ CRITICAL ERROR: Failed to open /dev/uinput (touch/mouse injection will not work!). Did you run `sudo chmod 666 /dev/uinput`?");
+                return Err(e);
             }
         };
 
@@ -119,10 +119,14 @@ impl UInputDevice {
             let _ = Self::ioctl(fd, UI_SET_ABSBIT, ABS_X as libc::c_ulong);
             let _ = Self::ioctl(fd, UI_SET_ABSBIT, ABS_Y as libc::c_ulong);
 
-            // Register standard mouse buttons (Left, Right, Middle)
+            // Register standard mouse buttons (Left, Right, Middle) and Touch
             let _ = Self::ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as libc::c_ulong);
             let _ = Self::ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as libc::c_ulong);
             let _ = Self::ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE as libc::c_ulong);
+            let _ = Self::ioctl(fd, UI_SET_KEYBIT, 0x14a as libc::c_ulong); // BTN_TOUCH
+
+            // Set device properties to indicate it's a direct touch device
+            let _ = Self::ioctl(fd, 0x4004556e, 0x01); // UI_SET_PROPBIT, INPUT_PROP_DIRECT
 
             // 4. Register all keyboard key bit codes (scan codes 1 to 248)
             for key in 1..248 {
@@ -148,17 +152,17 @@ impl UInputDevice {
             }
 
             // Try to write setup info via modern UI_DEV_SETUP ioctl
-            if false {
+            if true {
                 info!("Fallback to legacy uinput setup method...");
                 // Legacy fallback mechanism for older kernels
                 let mut legacy_setup = UinputUserDev {
                     name: setup.name,
                     id: setup.id,
                     ff_effects_max: 0,
-                    absmax: [0; 8],
-                    absmin: [0; 8],
-                    absfuzz: [0; 8],
-                    absflat: [0; 8],
+                    absmax: [0; 64],
+                    absmin: [0; 64],
+                    absfuzz: [0; 64],
+                    absflat: [0; 64],
                 };
                 
                 // Configure absolute coordinate ranges (for Touchscreen Absolute Mapping)
@@ -248,10 +252,13 @@ impl UInputDevice {
         self.sync()
     }
 
-    /// Emulates mouse clicks (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE).
+    /// Emulates mouse clicks (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE) or Touch events.
     pub fn inject_mouse_click(&mut self, button: u16, pressed: bool) -> io::Result<()> {
         let val = if pressed { 1 } else { 0 };
-        self.write_event(EV_KEY, button, val)?;
+        // If libinput expects a touchscreen (since we declared BTN_TOUCH + INPUT_PROP_DIRECT),
+        // we must send BTN_TOUCH (0x14a) instead of BTN_LEFT (0x110/272) for the primary "click/tap" action!
+        let final_button = if button == 272 { 0x14a } else { button };
+        self.write_event(EV_KEY, final_button, val)?;
         self.sync()
     }
 

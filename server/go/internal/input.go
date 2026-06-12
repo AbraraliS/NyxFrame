@@ -186,18 +186,13 @@ func handleCommand(message []byte) {
 
 	case "key":
 		cmdLog.Printf("Key %d %s", cmd.KeyCode+8, map[bool]string{true: "↓", false: "↑"}[cmd.Pressed])
-		x11Keycode := fmt.Sprintf("%d", cmd.KeyCode+8)
-		if cmd.Pressed {
-			runXdotool("keydown", x11Keycode)
-		} else {
-			runXdotool("keyup", x11Keycode)
-		}
+		_ = forwardCommandToUds(message)
 
 	case "mouseabsolute":
-		runXdotool("mousemove", fmt.Sprintf("%d", cmd.X), fmt.Sprintf("%d", cmd.Y))
+		_ = forwardCommandToUds(message)
 
 	case "mouserelative":
-		runXdotool("mousemove_relative", "--", fmt.Sprintf("%d", cmd.Dx), fmt.Sprintf("%d", cmd.Dy))
+		_ = forwardCommandToUds(message)
 
 	case "mouseclick":
 		buttonName := map[uint16]string{272: "LMB", 273: "RMB", 274: "MMB"}
@@ -206,30 +201,11 @@ func handleCommand(message []byte) {
 			btn = fmt.Sprintf("Btn%d", cmd.Button)
 		}
 		cmdLog.Printf("Click %s %s", btn, map[bool]string{true: "↓", false: "↑"}[cmd.Pressed])
-		var x11Button string
-		switch cmd.Button {
-		case 272:
-			x11Button = "1"
-		case 273:
-			x11Button = "3"
-		case 274:
-			x11Button = "2"
-		default:
-			x11Button = "1"
-		}
-		if cmd.Pressed {
-			runXdotool("mousedown", x11Button)
-		} else {
-			runXdotool("mouseup", x11Button)
-		}
+		_ = forwardCommandToUds(message)
 
 	case "mousescroll":
 		cmdLog.Printf("Scroll %+d", cmd.Steps)
-		if cmd.Steps > 0 {
-			runXdotool("click", "--repeat", fmt.Sprintf("%d", cmd.Steps), "4")
-		} else if cmd.Steps < 0 {
-			runXdotool("click", "--repeat", fmt.Sprintf("%d", -cmd.Steps), "5")
-		}
+		_ = forwardCommandToUds(message)
 	}
 }
 

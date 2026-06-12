@@ -9,6 +9,9 @@
 use std::io;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
+use gstreamer_video::VideoFrame;
+use gstreamer_video::VideoInfo;
+use gstreamer_video::VideoFrameExt;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
 use ashpd::WindowIdentifier;
@@ -61,6 +64,15 @@ impl WaylandCapturer {
             std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "NOT SET".into()));
 
         // ── Init GStreamer ─────────────────────────────────────────────────────
+        let is_niri = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase().contains("niri");
+        
+        if is_niri {
+            // Force GStreamer GL to use software rendering (llvmpipe) to bypass the
+            // EGL_BAD_MATCH crash caused by Intel Y-tiled CCS DMA-BUFs on Niri.
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+            log::info!("WaylandCapturer: Niri detected. Forcing LIBGL_ALWAYS_SOFTWARE=1");
+        }
+        
         gstreamer::init()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -125,13 +137,24 @@ impl WaylandCapturer {
             Ok::<_, io::Error>((fd.into_raw_fd(), node_id, w, h))
         })?;
 
-        // ── Build GStreamer pipeline from PipeWire source ─────────────────────
-        let pipeline_str = format!(
-            "pipewiresrc fd={fd} path={node_id} always-copy=true ! \
-             videoconvert ! \
-             video/x-raw,format=BGRx ! \
-             appsink name=sink max-buffers=2 drop=true emit-signals=false"
-        );
+        // ── GStreamer Pipeline Setup ───────────────────────────────────────────
+        // On GNOME/standard Wayland: videoconvert natively imports DMA-BUF (DMA_DRM)
+        // On Niri: glupload with software GL forces fallback to CPU SHM, bypassing EGL bug.
+        let pipeline_str = if is_niri {
+            format!(
+                "pipewiresrc fd={fd} path={path} ! \
+                 glupload ! glcolorconvert ! gldownload ! video/x-raw,format=BGRx ! \
+                 appsink name=sink max-buffers=2 drop=true emit-signals=false",
+                fd = fd, path = node_id
+            )
+        } else {
+            format!(
+                "pipewiresrc fd={fd} path={path} ! \
+                 videoconvert ! video/x-raw,format=BGRx ! \
+                 appsink name=sink max-buffers=2 drop=true emit-signals=false",
+                fd = fd, path = node_id
+            )
+        };
         log::info!("GStreamer pipeline: {}", pipeline_str);
 
         let pipeline = gstreamer::parse::launch(&pipeline_str)
@@ -158,26 +181,44 @@ impl WaylandCapturer {
         // Try pulling a sample with 50ms timeout (non-blocking feel)
         match self.appsink.try_pull_sample(gstreamer::ClockTime::from_mseconds(50)) {
             Some(sample) => {
-                // Update dimensions from actual caps (in case they differ from reported)
-                if let Some(caps) = sample.caps() {
-                    if let Some(st) = caps.structure(0) {
-                        if let (Ok(w), Ok(h)) = (
-                            st.get::<i32>("width"),
-                            st.get::<i32>("height"),
-                        ) {
-                            self.width = w as u32;
-                            self.height = h as u32;
-                        }
-                    }
-                }
+                let caps = match sample.caps() {
+                    Some(c) => c,
+                    None => return Ok(None),
+                };
 
-                let buffer = sample.buffer().ok_or_else(|| {
+                // Parse VideoInfo from caps so we know the real stride/layout
+                let video_info = VideoInfo::from_caps(&caps).map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Cannot parse VideoInfo from caps")
+                })?;
+
+                // Update our stored dimensions
+                self.width  = video_info.width();
+                self.height = video_info.height();
+
+                let buffer = sample.buffer_owned().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::Other, "No buffer in GStreamer sample")
                 })?;
-                let map = buffer.map_readable().map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "Cannot map GStreamer buffer")
-                })?;
-                Ok(Some(map.as_slice().to_vec()))
+
+                // Use VideoFrame instead of buffer.map_readable().
+                // This is mandatory when GstVideoMeta is present (DMA-BUF path from Niri):
+                // VideoFrame respects the meta strides/offsets, while map_readable() does
+                // not — causing the 'gst_video_frame_map_id: assertion failed' crash that
+                // dropped every frame and produced a blank/disappeared screen.
+                let frame = VideoFrame::from_buffer_readable(buffer, &video_info)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other,
+                        "Cannot map GStreamer buffer as VideoFrame"))?;
+
+                // Copy all plane data into a contiguous BGRx byte vector
+                let n_planes = frame.n_planes() as usize;
+                let mut out = Vec::with_capacity(
+                    (self.width * self.height * 4) as usize
+                );
+                for p in 0..n_planes {
+                    out.extend_from_slice(frame.plane_data(p as u32).map_err(|_| {
+                        io::Error::new(io::ErrorKind::Other, "Cannot read plane data")
+                    })?);
+                }
+                Ok(Some(out))
             }
             None => Ok(None), // Timeout — no new frame yet
         }
